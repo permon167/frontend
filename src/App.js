@@ -1,484 +1,779 @@
 // src/App.js
-import React, { useEffect, useMemo, useState } from "react";
-import {
-  BrowserRouter as Router,
-  Routes,
-  Route,
-  Link,
-  useLocation,
-  useNavigate,
-} from "react-router-dom";
+import React, { useEffect, useState } from "react";
+import { BrowserRouter as Router, Routes, Route } from "react-router-dom";
+import { jwtDecode } from "jwt-decode";
+import OID4VCIFlow from "./OID4VCIFlow.js";
 
-/** ========= Config ========= */
-const HOLDER_API =
-  process.env.REACT_APP_HOLDER_API || "http://localhost:8001";
-const VERIFIER_API =
-  process.env.REACT_APP_VERIFIER_API ||
-  "https://TU-DOMINIO-FIJO.ngrok-free.app";
+import axios from "axios";
+import { verifyCredentialJwt } from "@cef-ebsi/verifiable-credential";
+import { QRCodeCanvas } from "qrcode.react";
 
-const BYPASS = "ngrok-skip-browser-warning=true";
-const withBypass = (url) => {
-  const sep = url.includes("?") ? "&" : "?";
-  return `${url}${sep}${BYPASS}`;
+// Fuerza el backend (evita depender de .env para esta parte)
+const API_BASE = "http://localhost:8001";
+
+// Helpers para bypassear el interstitial de ngrok en TODAS las llamdas
+const withBypass = (url) =>
+  url + (url.includes("?") ? "&" : "?") + "ngrok-skip-browser-warning=true";
+
+const fetchBypass = (url, init = {}) => {
+  const headers = {
+    ...(init.headers || {}),
+    "ngrok-skip-browser-warning": "true",
+  };
+  return fetch(withBypass(url), { ...init, headers });
 };
 
-async function fetchBypass(url, init = {}) {
-  return fetch(withBypass(url), init);
-}
-async function getJSON(url) {
-  const r = await fetchBypass(url);
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-  return r.json();
-}
-async function postJSON(url, body) {
-  const r = await fetchBypass(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body ?? {}),
-  });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`HTTP ${r.status}: ${t || r.statusText}`);
-  }
-  return r.json();
-}
-const pretty = (x) => {
+// ==== Helpers UI para VP Preview ====
+function decodeVpJwtSafe(vpJwt) {
   try {
-    return JSON.stringify(x, null, 2);
-  } catch {
-    return String(x);
-  }
-};
-const rndState = (p = "STATE") =>
-  `${p}_${Math.random().toString(36).slice(2)}_${Date.now()}`;
-
-/** ====== helpers JWT ====== */
-function b64urlDecode(str) {
-  let s = str.replace(/-/g, "+").replace(/_/g, "/");
-  const pad = s.length % 4;
-  if (pad) s += "=".repeat(4 - pad);
-  return atob(s);
-}
-function decodeJwtParts(jwt) {
-  const [h, p] = String(jwt).split(".");
-  if (!h || !p) return { header: {}, payload: {} };
-  try {
-    const header = JSON.parse(b64urlDecode(h));
-    const payload = JSON.parse(b64urlDecode(p));
-    return { header, payload };
-  } catch {
-    return { header: {}, payload: {} };
-  }
-}
-
-/** ========= Vista de /verification-result (lee del Verifier) ========= */
-function VerificationResult() {
-  const [data, setData] = useState(null);
-  const location = useLocation();
-  const qs = useMemo(() => {
-    const u = new URLSearchParams(location.search);
-    return Object.fromEntries(u.entries());
-  }, [location.search]);
-
-  useEffect(() => {
-    (async () => {
+    const payload = jwtDecode(vpJwt);
+    const vcArray = payload?.vp?.verifiableCredential || [];
+    const vcSummaries = vcArray.map((vc) => {
       try {
-        const json = await getJSON(`${VERIFIER_API}/verifier/last-result`);
-        setData(json);
-      } catch (e) {
-        setData({ error: String(e) });
+        const vcp = typeof vc === "string" ? jwtDecode(vc) : vc;
+        const types = vcp?.vc?.type || vcp?.type || [];
+        const subject =
+          vcp?.sub ||
+          vcp?.vc?.credentialSubject?.id ||
+          vcp?.credentialSubject?.id ||
+          "";
+        return { types: Array.isArray(types) ? types : [types], subject };
+      } catch {
+        return { types: [], subject: "" };
       }
-    })();
-  }, []);
-
-  return (
-    <div className="container">
-      <h2>Resultado de verificación (Verifier)</h2>
-      <p><b>Parámetros de URL</b></p>
-      <pre>{pretty(qs)}</pre>
-      <p><b>/verifier/last-result</b></p>
-      <pre>{pretty(data)}</pre>
-      <Link to="/">⬅️ Volver</Link>
-    </div>
-  );
+    });
+    return { payload, vcSummaries };
+  } catch {
+    return null;
+  }
 }
 
-/** ========= Tarjeta de credencial ========= */
 function CredentialCard({
+  credential,
   index,
-  cred,
-  decoded,
-  onDecode,
   onDelete,
+  onViewDetails,
   onVerifyEBSI,
-  onAutoPresent,
+  onPresentAuto,
+  details,
+  ebsiResult,
+  ebsiLoading,
 }) {
-  const { header, payload } = cred || {};
-  const exp =
-    payload?.exp || payload?.expirationDate || payload?.vc?.expirationDate;
-
-  const subj =
-    payload?.vc?.credentialSubject ||
-    payload?.credentialSubject ||
-    {};
+  const subject = credential.credentialSubject || {};
+  const expiration = credential.expirationDate
+    ? new Date(credential.expirationDate).toLocaleString("es-ES")
+    : "—";
+  const typesDisplay = Array.isArray(details?.types)
+    ? details.types.join(", ")
+    : details?.types ?? "";
 
   return (
-    <div className="card" style={{ marginBottom: 12 }}>
-      <div className="card-header">
-        <strong>Credencial #{index}</strong>
+    <div style={{ border: "1px solid #ccc", padding: "1rem", borderRadius: "8px", marginBottom: "1rem" }}>
+      <h4>Credencial</h4>
+      <p><strong>Nombre:</strong> {subject.firstName}</p>
+      <p><strong>Apellido:</strong> {subject.lastName}</p>
+      <p><strong>Email:</strong> {subject.emailAddress}</p>
+      <p><strong>Expira:</strong> {expiration}</p>
+
+      <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+        <button onClick={() => onDelete(index)} style={{ color: "crimson" }}>🗑️ Eliminar</button>
+        <button onClick={() => onViewDetails(index)}>🔍 Ver detalle</button>
+        <button onClick={() => onVerifyEBSI(index)}>✅ OIDC4VP</button>
+        <button onClick={() => onPresentAuto(index)}>📤 Presentar (Auto OID4VP)</button>
       </div>
-      <div className="card-body">
-        <div>
-          <div><b>typ</b>: {header?.typ}</div>
-          <div><b>alg</b>: {header?.alg}</div>
-          {exp && <div><b>exp</b>: {String(exp)}</div>}
-          {Object.keys(subj).length > 0 && (
-            <div style={{ marginTop: 6 }}>
-              <b>Sujeto (preview)</b>
-              <pre>{pretty(subj)}</pre>
-            </div>
+
+      {details && (
+        <div style={{ marginTop: "1rem", backgroundColor: "#f8f8f8", padding: "1rem", borderRadius: "8px" }}>
+          <h5>🧾 Detalles decodificados</h5>
+          <p><strong>Issuer:</strong> {details.issuer}</p>
+          <p><strong>Subject:</strong> {details.subject}</p>
+          <p><strong>Tipos:</strong> {typesDisplay}</p>
+          {details.expiration && (
+            <p><strong>Expiración:</strong> {new Date(details.expiration * 1000).toLocaleString("es-ES")}</p>
           )}
         </div>
+      )}
 
-        <div style={{ marginTop: 8 }}>
-          <button onClick={() => onDecode(index)}>🔎 Ver detalle</button>{" "}
-          <button onClick={() => onDelete(index)}>🗑️ Eliminar</button>{" "}
-          <button onClick={onVerifyEBSI}>✅ OIDC4VP (QR Verifier)</button>{" "}
-          <button onClick={() => onAutoPresent(index)}>
-            📤 Presentar (Auto OID4VP)
-          </button>
+      {ebsiLoading && <p style={{ marginTop: 8 }}>⏳ Verificando con EBSI…</p>}
+      {ebsiResult && (
+        <div style={{
+          marginTop: "0.75rem",
+          border: `1px solid ${ebsiResult.ok ? "#2e7d32" : "#b71c1c"}`,
+          background: ebsiResult.ok ? "#e8f5e9" : "#ffebee",
+          padding: "0.75rem",
+          borderRadius: 8
+        }}>
+          <strong>{ebsiResult.ok ? "✅ VC válida (EBSI local)" : "❌ VC inválida (EBSI local)"}</strong>
+          <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, overflow: "auto", marginTop: 8 }}>
+{JSON.stringify(ebsiResult.details, null, 2)}
+          </pre>
         </div>
-
-        {decoded && (
-          <>
-            <p style={{ marginTop: 8 }}><b>Detalle decodificado</b></p>
-            <pre>{pretty(decoded)}</pre>
-          </>
-        )}
-      </div>
+      )}
     </div>
   );
 }
 
-/** ========= Pantalla principal (Holder) ========= */
-function WalletApp() {
-  const navigate = useNavigate();
+function VerificationResult() {
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const api = API_BASE.replace(/\/+$/, "");
 
-  const [holderDid, setHolderDid] = useState(
-    localStorage.getItem("holder_did") || ""
-  );
-  const [offerUrl, setOfferUrl] = useState("");
-  const [creds, setCreds] = useState([]); // [{ jwt, header, payload }]
-  const [decodedByIndex, setDecodedByIndex] = useState({});
-  const [openidUrl, setOpenidUrl] = useState("");
-  const [autoPresentResult, setAutoPresentResult] = useState(null);
-  const [verifierLast, setVerifierLast] = useState(null);
-  const [busy, setBusy] = useState(false);
-
-  // Auto-crear/obtener DID al cargar si no existe
   useEffect(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const success = urlParams.get("success");
+    const state = urlParams.get("state");
+    const code = urlParams.get("code");
+
+    setResult({
+      success: success === "true",
+      state,
+      code,
+      message: success === "true" ? "Verificación exitosa" : "Verificación fallida",
+    });
+
     (async () => {
       try {
-        if (holderDid && holderDid.startsWith("did:jwk:")) return;
-        const res = await postJSON(`${HOLDER_API}/holder/create-did-jwk`, {});
-        const did = res?.did || res?.holder_did || res?.did_jwk || "";
-        if (did) {
-          setHolderDid(did);
-          localStorage.setItem("holder_did", did);
+        const r = await fetchBypass(`${api}/verifier/last-result`);
+        if (r.ok) {
+          const details = await r.json();
+          setResult((prev) => ({ ...prev, details }));
         }
       } catch {
-        // si falla, el usuario podrá pegarlo manualmente
+        // ignore
+      } finally {
+        setLoading(false);
       }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [api]);
 
-  // Lista credenciales SOLO cuando ya hay DID
-  useEffect(() => {
-    if (holderDid && holderDid.startsWith("did:jwk:")) {
-      refreshCreds();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [holderDid]);
-
-  const normalizeCredentialItem = (item) => {
-    const jwt =
-      (typeof item === "string" && item) ||
-      item?.jwt ||
-      item?.credential ||
-      item?.raw ||
-      "";
-
-    const { header, payload } = decodeJwtParts(jwt);
-    return { jwt, header, payload };
-  };
-
-  const refreshCreds = async () => {
-    setBusy(true);
-    try {
-      const json = await postJSON(`${HOLDER_API}/holder/credentials`, {
-        holder_did: holderDid,
-        password: "default",
-      });
-      const list = Array.isArray(json?.credentials) ? json.credentials : json;
-      const arr = (Array.isArray(list) ? list : []).map(normalizeCredentialItem);
-      setCreds(arr);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const receiveOffer = async () => {
-    setBusy(true);
-    try {
-      const did = holderDid;
-      if (!did?.startsWith("did:jwk:")) {
-        throw new Error("No se pudo obtener el DID del holder.");
-      }
-      await postJSON(`${HOLDER_API}/holder/receive-oid4vc`, {
-        credential_offer_uri: offerUrl,
-        holder_did: did,
-        password: "default",
-      });
-      await refreshCreds();
-      alert("✅ Credencial recibida.");
-    } catch (e) {
-      alert("❌ " + e.message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const decodeCredential = async (index) => {
-    try {
-      const target = creds[index]?.jwt;
-      if (!target) return;
-      const result = await postJSON(`${HOLDER_API}/holder/decode-credential`, {
-        holder_did: holderDid,         // 👈 añadido
-        jwt: target,
-      });
-      setDecodedByIndex((m) => ({ ...m, [index]: result }));
-    } catch (e) {
-      alert("❌ " + e.message);
-    }
-  };
-
-  const deleteCredential = async (index) => {
-    if (!window.confirm(`¿Eliminar credencial #${index}?`)) return;
-    try {
-      await postJSON(`${HOLDER_API}/holder/delete-credential`, {
-        holder_did: holderDid,
-        password: "default",
-        index,
-      });
-      await refreshCreds();
-    } catch (e) {
-      alert("❌ " + e.message);
-    }
-  };
-
-  // OIDC4VP (QR): pedir openid:// al Verifier (necesita CORS en Verifier)
-  const handleVerifyWithEBSI = async () => {
-    setBusy(true);
-    try {
-      const state = rndState("EBSI");
-      const u = new URL(`${VERIFIER_API}/authorize/openid`);
-      u.searchParams.set("flow", "vp");
-      u.searchParams.set("format", "json");
-      u.searchParams.set("response_type", "vp_token id_token");
-      u.searchParams.set("client_id", "dummy-client");
-      u.searchParams.set("redirect_uri", "openid://");
-      u.searchParams.set("scope", "openid");
-      u.searchParams.set("state", state);
-      u.searchParams.set("response_mode", "direct_post");
-
-      const j = await getJSON(u.toString()); // ← “Failed to fetch” si CORS no está habilitado en Verifier
-      const openid = j.openid_url ?? j.openid;
-      setOpenidUrl(openid || "");
-
-      try {
-        const last = await getJSON(`${VERIFIER_API}/verifier/last-result`);
-        setVerifierLast(last);
-      } catch { /* noop */ }
-    } catch (e) {
-      alert("❌ " + e.message + "\n¿Has habilitado CORS en el Verifier para http://localhost:3000?");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  // Presentar: Holder firma y ENVÍA VP al Verifier, luego navegamos a la vista que lee del Verifier
-  const handleAutoPresent = async (index) => {
-    setBusy(true);
-    try {
-      const did = holderDid;
-      if (!did?.startsWith("did:jwk:")) {
-        throw new Error("No se pudo obtener el DID del holder.");
-      }
-      const state = rndState("PRESENT");
-
-      const body = {
-        holder_did: did,
-        password: "default",
-        select: [index],
-        send: true,
-        auth: {
-          redirect_uri: `${VERIFIER_API}/verifier/response`,
-          state,
-        },
-      };
-
-      const data = await postJSON(`${HOLDER_API}/wallet/present`, body);
-      setAutoPresentResult(data);
-
-      // Éxito si sent==true y post_status es código 200/302 (número o string) o “ok/success”
-      const ps = String(data?.post_status ?? "").toLowerCase();
-      const code = Number.isFinite(data?.post_status) ? data.post_status : NaN;
-      const ok =
-        data?.sent === true &&
-        (code === 200 || code === 302 ||
-          ps === "200" || ps === "302" ||
-          ps.includes("ok") || ps.includes("success"));
-
-      if (ok) {
-        navigate("/verification-result");
-      } else {
-        try {
-          const last = await getJSON(`${VERIFIER_API}/verifier/last-result`);
-          setVerifierLast(last);
-        } catch { /* noop */ }
-        alert("⚠️ Presentación generada pero no enviada (revisa logs / post_status).");
-      }
-    } catch (e) {
-      alert("❌ " + e.message);
-    } finally {
-      setBusy(false);
-    }
-  };
+  if (loading) return <div style={{ padding: "2rem" }}>⏳ Cargando resultado...</div>;
 
   return (
-    <div className="container" style={{ maxWidth: 960, margin: "0 auto" }}>
-      <header style={{ display: "flex", justifyContent: "space-between" }}>
-        <h1>Wallet SSI (Holder)</h1>
-        <nav>
-          <Link to="/verification-result">Ver /verifier/last-result</Link>
-        </nav>
-      </header>
+    <div style={{ padding: "2rem", fontFamily: "sans-serif" }}>
+      <h2>📋 Resultado de Verificación EBSI (OIDC4VP)</h2>
+      <div style={{
+        padding: "1rem",
+        backgroundColor: result?.success ? "#d4edda" : "#f8d7da",
+        border: `1px solid ${result?.success ? "#c3e6cb" : "#f5c6cb"}`,
+        borderRadius: "8px",
+        marginBottom: "1rem"
+      }}>
+        <h3>{result?.success ? "✅ Verificación Exitosa" : "❌ Verificación Fallida"}</h3>
+        <p><strong>Estado:</strong> {result?.state}</p>
+        <p><strong>Código:</strong> {result?.code}</p>
+      </div>
 
-      <section className="card" style={{ marginBottom: 16 }}>
-        <div className="card-header"><strong>Configuración</strong></div>
-        <div className="card-body" style={{ display: "grid", gap: 8 }}>
-          <label>
-            Holder DID (did:jwk):
-            <input
-              style={{ width: "100%" }}
-              value={holderDid}
-              onChange={(e) => {
-                setHolderDid(e.target.value);
-                localStorage.setItem("holder_did", e.target.value);
-              }}
-              placeholder="did:jwk:..."
-              readOnly={!holderDid}
-            />
-          </label>
-          <div style={{ fontSize: 12, opacity: 0.8 }}>
-            <div><b>Holder API:</b> {HOLDER_API}</div>
-            <div><b>Verifier API:</b> {VERIFIER_API}</div>
-          </div>
-          <div>
-            <button
-              onClick={refreshCreds}
-              disabled={busy || !(holderDid && holderDid.startsWith("did:jwk:"))}
-              title={
-                holderDid && holderDid.startsWith("did:jwk:")
-                  ? "Refrescar credenciales"
-                  : "Primero obtenemos el DID"
-              }
-            >
-              🔄 Refrescar credenciales
-            </button>
-          </div>
-        </div>
-      </section>
-
-      <section className="card" style={{ marginBottom: 16 }}>
-        <div className="card-header"><strong>Recibir credencial (OID4VCI)</strong></div>
-        <div className="card-body">
-          <label>
-            URL/QR (credential_offer_uri):
-            <input
-              style={{ width: "100%" }}
-              value={offerUrl}
-              onChange={(e) => setOfferUrl(e.target.value)}
-              placeholder="openid-credential-offer://?credential_offer=..."
-            />
-          </label>
-          <div style={{ marginTop: 8 }}>
-            <button
-              onClick={receiveOffer}
-              disabled={
-                busy ||
-                !offerUrl ||
-                !(holderDid && holderDid.startsWith("did:jwk:"))
-              }
-              title={
-                holderDid && holderDid.startsWith("did:jwk:")
-                  ? "Recibir credencial externa"
-                  : "Primero obtenemos el DID"
-              }
-            >
-              🎫 Recibir credencial externa
-            </button>
-          </div>
-        </div>
-      </section>
-
-      <section className="card" style={{ marginBottom: 16 }}>
-        <div className="card-header"><strong>Credenciales en la wallet</strong></div>
-        <div className="card-body">
-          {creds.length === 0 && <p>No hay credenciales almacenadas.</p>}
-          {creds.map((c, i) => (
-            <CredentialCard
-              key={i}
-              index={i}
-              cred={c}
-              decoded={decodedByIndex[i]}
-              onDecode={decodeCredential}
-              onDelete={deleteCredential}
-              onVerifyEBSI={handleVerifyWithEBSI}
-              onAutoPresent={handleAutoPresent}
-            />
-          ))}
-        </div>
-      </section>
-
-      <section className="card" style={{ marginBottom: 16 }}>
-        <div className="card-header"><strong>Debug</strong></div>
-        <div className="card-body">
-          <p><b>openid:// (del Verifier)</b></p>
-          <pre style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
-            {openidUrl || "—"}
+      {result?.details && (
+        <div style={{ backgroundColor: "#f8f9fa", padding: "1rem", borderRadius: "8px", marginBottom: "1rem" }}>
+          <h4>📊 Detalles técnicos:</h4>
+          <pre style={{ fontSize: "12px", overflow: "auto" }}>
+{JSON.stringify(result.details, null, 2)}
           </pre>
-
-          <p><b>Auto-presentación (/wallet/present en Holder)</b></p>
-          <pre>{pretty(autoPresentResult || {})}</pre>
-
-          <p><b>Último resultado del Verifier (/verifier/last-result)</b></p>
-          <pre>{pretty(verifierLast || {})}</pre>
         </div>
-      </section>
+      )}
+
+      <button
+        onClick={() => (window.location.href = "/")}
+        style={{ padding: "10px 20px", backgroundColor: "#007bff", color: "white", border: "none", borderRadius: "4px" }}
+      >
+        🏠 Volver al inicio
+      </button>
     </div>
   );
 }
 
-/** ========= App con rutas ========= */
-export default function App() {
+function WalletApp() {
+  const [holderDid, setHolderDid] = useState(null);
+  const [credentials, setCredentials] = useState([]);
+  const [offerUri, setOfferUri] = useState("");
+  const [message, setMessage] = useState("");
+  const [decodedDetails, setDecodedDetails] = useState({});
+  const [verificationStatus, setVerificationStatus] = useState("");
+
+  // OIDC4VP (QR simple)
+  const [openIdUrl, setOpenIdUrl] = useState("");
+
+  // Estados para auto-presentación
+  const [autoPresentLoading, setAutoPresentLoading] = useState(false);
+  const [autoPresentResult, setAutoPresentResult] = useState(null);
+
+  // Resultado + VP para vista previa
+  const [verificationResult, setVerificationResult] = useState(null);
+  const [vpToken, setVpToken] = useState("");
+
+  // EBSI local por credencial (no enlazado en UI por defecto)
+  const [ebsiLoadingIndex, setEbsiLoadingIndex] = useState(-1);
+  const [ebsiResults, setEbsiResults] = useState({}); // { [index]: { ok, details } }
+
+  axios.defaults.timeout = 15000;
+
+  useEffect(() => {
+    const init = async () => {
+      let storedDid = localStorage.getItem("holderDid");
+      if (!storedDid) {
+        const res = await fetchBypass(`${API_BASE}/holder/create-did-jwk`, { method: "POST" });
+        const data = await res.json();
+        storedDid = data.did;
+        localStorage.setItem("holderDid", storedDid);
+      }
+      setHolderDid(storedDid);
+    };
+    init();
+  }, []);
+
+  const receiveOid4vc = async () => {
+    if (!offerUri || !holderDid) {
+      alert("Faltan campos");
+      return;
+    }
+    try {
+      const res = await fetchBypass(`${API_BASE}/holder/receive-oid4vc`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          credential_offer_uri: offerUri,
+          holder_did: holderDid,
+          password: "default",
+        }),
+      });
+      await res.json();
+      if (!res.ok) {
+        alert("❌ Error al recibir la credencial");
+        return;
+      }
+      await loadAllCredentials();
+      setMessage("💾 Credencial guardada en la wallet");
+    } catch (err) {
+      console.error("❌ Error general:", err);
+      alert("Error inesperado al recibir la credencial");
+    }
+  };
+
+  const loadAllCredentials = async () => {
+    try {
+      const res = await fetchBypass(`${API_BASE}/holder/credentials`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          holder_did: holderDid,
+          password: "default",
+        }),
+      });
+      const data = await res.json();
+      const decodedCreds = (data.credentials || []).map((c) => {
+        const jwt = c.credential || c;
+        return jwtDecode(jwt);
+      });
+      setCredentials(decodedCreds);
+    } catch (err) {
+      console.error("❌ No se pudieron cargar credenciales:", err);
+    }
+  };
+
+  const handleDeleteCredential = async (index) => {
+    try {
+      const res = await fetchBypass(`${API_BASE}/holder/delete-credential`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          holder_did: holderDid,
+          password: "default",
+          index,
+        }),
+      });
+      const result = await res.json();
+      if (res.ok) {
+        alert("Credencial eliminada");
+        await loadAllCredentials();
+      } else {
+        alert("❌ Error al eliminar: " + result.error);
+      }
+    } catch (err) {
+      alert("❌ Error inesperado al eliminar la credencial");
+    }
+  };
+
+  const handleViewDetails = async (index) => {
+    try {
+      const res = await fetchBypass(`${API_BASE}/holder/decode-credential`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          holder_did: holderDid,
+          password: "default",
+          index,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setDecodedDetails((prev) => ({ ...prev, [index]: data }));
+      } else {
+        alert("❌ Error al decodificar credencial: " + data.error);
+      }
+    } catch (err) {
+      alert("❌ Error inesperado al decodificar credencial");
+      console.error(err);
+    }
+  };
+
+  // --- OIDC4VP: petición robusta al JSON con openid_url + bypass ngrok ---
+  const handleVerifyWithEBSI = async () => {
+    try {
+      setVerificationStatus("🔄 Preparando solicitud OIDC4VP…");
+      console.log("API_BASE =", API_BASE);
+
+      const u1 = `${API_BASE}/authorize/openid?flow=vp&format=json`;
+      const u2 = `${API_BASE}/authorize?flow=vp&format=json`;
+
+      let openid = "";
+
+      // 1) Intento principal: /authorize/openid?flow=vp
+      try {
+        const r = await fetchBypass(u1, {
+          method: "GET",
+          headers: { Accept: "application/json" },
+          cache: "no-store",
+        });
+        const raw = await r.text();
+        console.log("[authorize/openid] status", r.status, "raw:", raw);
+
+        if (r.ok && raw) {
+          let data;
+          try { data = JSON.parse(raw); } catch { data = {}; }
+          openid = String(data.openid_url || data.openid || data.location || "").trim();
+          if (openid.startsWith('"') && openid.endsWith('"')) openid = openid.slice(1, -1);
+        }
+      } catch (e) {
+        console.warn("Fallo en /authorize/openid:", e);
+      }
+
+      // 2) Fallback: /authorize?flow=vp&format=json
+      if (!openid || !openid.startsWith("openid://")) {
+        try {
+          const r2 = await fetchBypass(u2, {
+            method: "GET",
+            headers: { Accept: "application/json" },
+            cache: "no-store",
+          });
+          const raw2 = await r2.text();
+          console.log("[authorize?format=json] status", r2.status, "raw:", raw2);
+
+          if (r2.ok && raw2) {
+            let data2;
+            try { data2 = JSON.parse(raw2); } catch { data2 = {}; }
+            let candidate = String(data2.openid_url || data2.openid || data2.location || "").trim();
+            if (candidate.startsWith('"') && candidate.endsWith('"')) candidate = candidate.slice(1, -1);
+            if (candidate.startsWith("openid://")) openid = candidate;
+          }
+        } catch (e) {
+          console.warn("Fallo en /authorize?format=json:", e);
+        }
+      }
+
+      console.log("computed openid =", openid);
+      if (!openid || !openid.startsWith("openid://")) {
+        setVerificationStatus("❌ Respuesta inválida: falta openid:// (revisa consola → raw)");
+        return;
+      }
+
+      setOpenIdUrl(openid);
+      setVerificationStatus("📱 Escanea el QR con tu wallet para continuar");
+      // Si quieres abrir automáticamente en móvil:
+      // if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) window.location.href = openid;
+    } catch (e) {
+      console.error("❌ Error OIDC4VP:", e);
+      setVerificationStatus("❌ Error al iniciar la verificación con OIDC4VP");
+    }
+  };
+
+  // Auto-presentación: intenta /wallet/present; si 404, fallback a /presentations/auto-from-authorize
+  const handlePresentAuto = async (index) => {
+    setAutoPresentLoading(true);
+    setAutoPresentResult(null);
+    setVerificationResult(null);
+    setVpToken("");
+    try {
+      const body = {
+        authorize_url: `${API_BASE}/authorize/openid?flow=vp`,
+        holder_did: holderDid,
+        password: "default",
+        select: [Number(index)],
+      };
+
+      // 1º intento: endpoint nuevo
+      let res = await fetchBypass(`${API_BASE}/wallet/present`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      // Fallback: endpoint antiguo si el nuevo no existe
+      if (res.status === 404) {
+        res = await fetchBypass(`${API_BASE}/presentations/auto-from-authorize`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            verifier_base: API_BASE,
+            holder_did: holderDid,
+            password: "default",
+            index: Number(index),
+          }),
+        });
+      }
+
+      const data = await res.json().catch(() => ({}));
+      if (data.vp_jwt) setVpToken(String(data.vp_jwt));
+
+      if (res.ok) {
+        setAutoPresentResult({
+          success: true,
+          status: data.status || res.status,
+          response: "Presentation sent from backend",
+          data,
+        });
+        const verdict = data?.verdict;
+        if (verdict && typeof verdict.ok === "boolean") {
+          setVerificationResult(verdict);
+          setMessage(verdict.ok ? "✅ Verificación correcta" : "❌ Verificación fallida");
+        } else {
+          setMessage("ℹ️ Presentación enviada. Revisa el veredicto o la redirección.");
+        }
+      } else {
+        setAutoPresentResult({
+          success: false,
+          status: res.status,
+          error: data.error || "Error en auto-presentación",
+          data,
+        });
+        setVerificationResult({ ok: false, message: data.error || "Error en auto-presentación" });
+      }
+    } catch (err) {
+      setAutoPresentResult({ success: false, error: err.message });
+      setVerificationResult({ ok: false, message: err.message });
+      setMessage(`❌ Error en auto-presentación: ${err.message}`);
+    } finally {
+      setAutoPresentLoading(false);
+    }
+  };
+
+  // Verificación EBSI local (VC-JWT) por índice (conservado por si se usa)
+  const verifyVcLocal = async (index) => {
+    setEbsiLoadingIndex(index);
+    try {
+      const { data } = await axios.post(
+        withBypass(`${API_BASE}/holder/jwt-credential`),
+        { holder_did: holderDid, password: "default", index },
+        { headers: { "ngrok-skip-browser-warning": "true" } }
+      );
+      const vcJwt = data?.jwt;
+      if (!vcJwt) throw new Error("No se obtuvo el VC-JWT");
+
+      // Estructura básica de JWT
+      try {
+        const base64Header = vcJwt.split('.')[0];
+        JSON.parse(atob(base64Header));
+        const base64Payload = vcJwt.split('.')[1];
+        JSON.parse(atob(base64Payload));
+      } catch {
+        throw new Error("JWT malformado: no se puede decodificar");
+      }
+
+      const result = await verifyCredentialJwt(vcJwt, {
+        hosts: ["api-pilot.ebsi.eu"],
+        scheme: "ebsi",
+        network: { name: "pilot", isOptional: false },
+        services: {
+          "did-registry": "v5",
+          "trusted-issuers-registry": "v5",
+          "trusted-policies-registry": "v3",
+          "trusted-schemas-registry": "v3",
+        },
+      }, {
+        skipAccreditationsValidation: true,
+        skipStatusValidation: true,
+      });
+
+      setEbsiResults((prev) => ({ ...prev, [index]: { ok: true, details: result } }));
+    } catch (err) {
+      let errorDetails = { error: err?.message || String(err) };
+      if (err.message && err.message.includes("kid")) {
+        errorDetails = {
+          error: "VC no compatible con EBSI",
+          reason: "Falta el header 'kid' requerido por EBSI",
+          suggestion: "El header 'kid' debe contener el DID del emisor con el identificador del método de verificación.",
+          original_error: err.message,
+          ebsi_compatible: false
+        };
+      } else if (err.message && err.message.includes("JWT header")) {
+        errorDetails = {
+          error: "Error en headers JWT",
+          reason: "Los headers del JWT no cumplen con los requisitos EBSI",
+          suggestion: "Verifica headers (alg, kid, typ)",
+          original_error: err.message,
+          ebsi_compatible: false
+        };
+      } else if (err.message && err.message.includes("algorithm")) {
+        errorDetails = {
+          error: "Algoritmo no soportado",
+          reason: "Algoritmo no compatible",
+          suggestion: "EBSI suele requerir ES256/ES256K/EdDSA",
+          original_error: err.message,
+          ebsi_compatible: false
+        };
+      } else if (err.message && (err.message.includes("issuer") || err.message.includes("iss"))) {
+        errorDetails = {
+          error: "Emisor no válido",
+          reason: "iss no válido/registrado",
+          suggestion: "El emisor debe ser un DID válido",
+          original_error: err.message,
+          ebsi_compatible: false
+        };
+      }
+      setEbsiResults((prev) => ({ ...prev, [index]: { ok: false, details: errorDetails } }));
+    } finally {
+      setEbsiLoadingIndex(-1);
+    }
+  };
+
+  // === UI ===
+  return (
+    <div style={{ padding: "2rem", fontFamily: "sans-serif" }}>
+      <h2>📱 Holder Wallet</h2>
+
+      {message && (
+        <div style={{
+          padding: "10px",
+          backgroundColor: message.startsWith("❌") ? "#f8d7da" : (message.startsWith("⚠️") ? "#fff3cd" : "#e2f0d9"),
+          border: "1px solid #ddd",
+          borderRadius: "4px",
+          marginBottom: "1rem",
+        }}>
+          {message}
+        </div>
+      )}
+
+      {verificationStatus && (
+        <div style={{
+          padding: "10px",
+          backgroundColor: "#d1ecf1",
+          border: "1px solid #bee5eb",
+          borderRadius: "4px",
+          marginBottom: "1rem",
+        }}>
+          {verificationStatus}
+        </div>
+      )}
+
+      <p><strong>Mi DID:</strong><br />{holderDid || "Generando..."}</p>
+
+      <hr />
+      <h3>Recibir credencial desde emisor externo (OpenID4VCI)</h3>
+      <input
+        type="text"
+        placeholder="Pega el credential_offer_uri"
+        value={offerUri}
+        onChange={(e) => setOfferUri(e.target.value)}
+        style={{ width: "100%" }}
+      />
+      <br /><br />
+      <button onClick={receiveOid4vc}>📥 Recibir credencial externa</button>
+
+      <hr />
+      <h3>Credenciales guardadas</h3>
+      <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+        <button onClick={loadAllCredentials}>📚 Mostrar todas</button>
+        <button onClick={handleVerifyWithEBSI}>✅ OIDC4VP</button>
+      </div>
+
+      {/* Bloque QR OIDC4VP (si se obtuvo openid:// por JSON) */}
+      {openIdUrl && (
+        <div style={{ marginTop: 16, padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
+          <h4>Escanea con tu wallet OIDC4VP</h4>
+          <QRCodeCanvas value={openIdUrl} size={280} />
+          <p style={{ wordBreak: "break-all", fontSize: 12, marginTop: 8 }}>{openIdUrl}</p>
+
+          <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+            <button onClick={() => setOpenIdUrl("")}>🧹 Ocultar QR</button>
+            <button onClick={() => navigator.clipboard.writeText(openIdUrl)}>📋 Copiar enlace</button>
+          </div>
+        </div>
+      )}
+
+      <div style={{ marginTop: "1rem" }}>
+        {credentials.length > 0 ? (
+          credentials.map((cred, idx) => (
+            <CredentialCard
+              key={idx}
+              credential={cred}
+              index={idx}
+              onDelete={handleDeleteCredential}
+              onViewDetails={handleViewDetails}
+              onVerifyEBSI={handleVerifyWithEBSI}
+              onPresentAuto={handlePresentAuto}
+              details={decodedDetails[idx]}
+              ebsiResult={ebsiResults[idx]}
+              ebsiLoading={ebsiLoadingIndex === idx}
+            />
+          ))
+        ) : (
+          <p>🎃 No hay credenciales</p>
+        )}
+      </div>
+
+      {/* Resultado de auto-presentación */}
+      {autoPresentLoading && (
+        <div style={{ marginTop: "1rem", padding: "1rem", backgroundColor: "#fff3cd", border: "1px solid #ffeaa7", borderRadius: "8px" }}>
+          <p>⏳ Enviando presentación automática...</p>
+        </div>
+      )}
+
+      {autoPresentResult && (
+        <div style={{
+          marginTop: "1rem",
+          padding: "1rem",
+          backgroundColor: autoPresentResult.success ? "#d4edda" : "#f8d7da",
+          border: `1px solid ${autoPresentResult.success ? "#c3e6cb" : "#f5c6cb"}`,
+          borderRadius: "8px"
+        }}>
+          <h4>{autoPresentResult.success ? "✅ Auto-presentación exitosa" : "❌ Error en auto-presentación"}</h4>
+          {autoPresentResult.error && <p><strong>Error:</strong> {autoPresentResult.error}</p>}
+          {autoPresentResult.status && <p><strong>Status:</strong> {autoPresentResult.status}</p>}
+          <details style={{ marginTop: "0.5rem" }}>
+            <summary>Ver detalles técnicos</summary>
+            <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, overflow: "auto", marginTop: 8 }}>
+{JSON.stringify(autoPresentResult, null, 2)}
+            </pre>
+          </details>
+        </div>
+      )}
+
+      {/* Badge de verificación y resumen */}
+      {verificationResult && (
+        <div style={{
+          marginTop: "1rem",
+          padding: "12px",
+          borderRadius: 10,
+          border: `1px solid ${verificationResult.ok ? "#22c55e" : "#ef4444"}`,
+          background: verificationResult.ok ? "#052e16" : "#3f1d1d",
+          color: "#e5e7eb"
+        }}>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <span style={{
+              display:"inline-block", width:10, height:10, borderRadius:"50%",
+              background: verificationResult.ok ? "#22c55e" : "#ef4444"
+            }} />
+            <strong>
+              {verificationResult.ok ? "✔ Verificación correcta" : "✖ Verificación fallida"}
+            </strong>
+          </div>
+          <div style={{marginTop:6, opacity:0.9}}>
+            {verificationResult.message || (verificationResult.ok ? "VP y VC válidas" : "Revisa el detalle")}
+          </div>
+
+          {/* Resumen audit-friendly */}
+          <div style={{marginTop:10, padding:12, border:"1px solid #334155", borderRadius:10}}>
+            <div style={{display:"grid", gridTemplateColumns:"140px 1fr", gap:6, fontSize:13}}>
+              <div><b>aud</b></div><div style={{wordBreak:"break-all"}}>{verificationResult.vp?.aud || "—"}</div>
+              <div><b>nonce</b></div><div style={{wordBreak:"break-all"}}>{verificationResult.vp?.nonce || "—"}</div>
+              <div><b>iss/sub</b></div><div style={{wordBreak:"break-all"}}>{verificationResult.vp?.iss || "—"}</div>
+              <div><b>iat/exp</b></div>
+              <div>
+                {verificationResult.vp?.iat ? new Date(verificationResult.vp.iat*1000).toLocaleString("es-ES") : "—"}
+                {" → "}
+                {verificationResult.vp?.exp ? new Date(verificationResult.vp.exp*1000).toLocaleString("es-ES") : "—"}
+              </div>
+            </div>
+
+            <h4 style={{marginTop:10}}>VCs verificadas</h4>
+            {(verificationResult.vc_verifications || []).map((v,i)=>(
+              <div key={i} style={{display:"flex",gap:8, alignItems:"center"}}>
+                <span style={{
+                  display:"inline-block", width:8, height:8, borderRadius:"50%",
+                  background: v.verified ? "#22c55e" : "#ef4444"
+                }} />
+                <code>VC[{v.index}]</code> — {v.verified ? "válida" : `inválida: ${v.error || "motivo no disponible"}`}
+              </div>
+            ))}
+
+            {!verificationResult.pex_ok && (verificationResult.pex_errors || []).length > 0 && (
+              <>
+                <h4 style={{marginTop:10}}>Errores PEX</h4>
+                <ul style={{marginTop:4}}>
+                  {(verificationResult.pex_errors||[]).map((e,idx)=><li key={idx}>{e}</li>)}
+                </ul>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Vista previa de la VP (resumen + copiar/descargar) */}
+      {vpToken && (
+        <div style={{ marginTop: 16, padding: 12, border: "1px solid #334155", borderRadius: 8, background: "#0b1220", color:"#e2e8f0" }}>
+          <h4>🧾 Vista previa de la Presentación</h4>
+          {(() => {
+            const decoded = decodeVpJwtSafe(vpToken);
+            if (!decoded) return <div>No se pudo decodificar la VP-JWT.</div>;
+            const p = decoded.payload;
+            return (
+              <>
+                <div style={{ display: "grid", gridTemplateColumns: "130px 1fr", gap: 6, fontSize: 13 }}>
+                  <div><strong>iss</strong></div><div style={{wordBreak:"break-all"}}>{p.iss}</div>
+                  <div><strong>sub</strong></div><div style={{wordBreak:"break-all"}}>{p.sub}</div>
+                  <div><strong>aud</strong></div><div style={{wordBreak:"break-all"}}>{p.aud}</div>
+                  <div><strong>nonce</strong></div><div style={{wordBreak:"break-all"}}>{p.nonce}</div>
+                  <div><strong>iat</strong></div><div>{p.iat ? new Date(p.iat*1000).toLocaleString("es-ES") : "—"}</div>
+                  <div><strong>exp</strong></div><div>{p.exp ? new Date(p.exp*1000).toLocaleString("es-ES") : "—"}</div>
+                </div>
+
+                <h5 style={{ marginTop: 10 }}>Credenciales en la VP</h5>
+                {decoded.vcSummaries.length === 0 ? "—" : (
+                  <ul>
+                    {decoded.vcSummaries.map((s, i) => (
+                      <li key={i}>
+                        <strong>Tipos:</strong> {(s.types || []).join(", ") || "—"} · <strong>Subject:</strong> {s.subject || "—"}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
+                <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                  <button onClick={() => navigator.clipboard.writeText(vpToken)}>📋 Copiar VP-JWT</button>
+                  <button onClick={() => {
+                    const blob = new Blob([vpToken], { type: "text/plain" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url; a.download = "vp.jwt";
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}>💾 Descargar</button>
+                </div>
+
+                <details style={{ marginTop: 10 }}>
+                  <summary>Ver VP completa (JSON)</summary>
+                  <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, overflow: "auto", marginTop: 8 }}>
+{JSON.stringify(p, null, 2)}
+                  </pre>
+                </details>
+              </>
+            );
+          })()}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function App() {
   return (
     <Router>
       <Routes>
         <Route path="/" element={<WalletApp />} />
+        <Route path="/dbc-test" element={<OID4VCIFlow />} />
         <Route path="/verification-result" element={<VerificationResult />} />
       </Routes>
     </Router>
   );
 }
+
+export default App;
